@@ -1,293 +1,124 @@
-"use strict";
+"""Clean Code Checker — web server.
 
-const form = document.getElementById("analyze-form");
-const repoInput = document.getElementById("repo");
-const tokenInput = document.getElementById("token");
-const button = document.getElementById("analyze-btn");
-const statusEl = document.getElementById("status");
-const reportEl = document.getElementById("report");
+Run ``python app.py`` and open http://localhost:8000. The server has no
+third-party dependencies: it uses Python's standard library only.
 
-const SEVERITIES = ["major", "minor", "info"];
+  * ``GET /``            -> the single-page UI
+  * ``GET /api/analyze`` -> JSON report for ?repo=<url>
 
-let lastReport = null;
+An optional GitHub token is accepted through the ``Authorization: Bearer``
+header so credentials never appear in request URLs or access logs.
+"""
 
-form.addEventListener("submit", (event) => {
-  event.preventDefault();
-  runAnalysis(repoInput.value.trim(), tokenInput.value.trim());
-});
+from __future__ import annotations
 
-document.querySelectorAll(".chip").forEach((chip) => {
-  chip.addEventListener("click", () => {
-    repoInput.value = chip.dataset.repo;
-    runAnalysis(chip.dataset.repo, tokenInput.value.trim());
-  });
-});
+import json
+import mimetypes
+import os
+import sys
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-async function runAnalysis(repo, token) {
-  if (!repo) return;
-  setBusy(true);
-  showLoading(repo);
-  reportEl.hidden = true;
+from cleancode import GitHubError, analyze_repo
 
-  try {
-    const params = new URLSearchParams({ repo });
-    if (token) params.set("token", token);
-    const response = await fetch(`/api/analyze?${params.toString()}`);
-    const data = await response.json();
-    if (!response.ok || data.error) {
-      throw new Error(data.error || `Request failed (${response.status}).`);
-    }
-    renderReport(data);
-  } catch (error) {
-    showError(error.message);
-  } finally {
-    setBusy(false);
-  }
-}
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("PORT", "8000"))
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
-function setBusy(busy) {
-  button.disabled = busy;
-  button.textContent = busy ? "Analyzing…" : "Analyze";
-}
 
-function showLoading(repo) {
-  statusEl.hidden = false;
-  statusEl.className = "status loading";
-  statusEl.innerHTML = `<div class="spinner"></div>
-    <div>Fetching <b>${escapeHtml(repo)}</b> and scanning its source files…</div>`;
-}
+def extract_bearer_token(authorization: str | None) -> str | None:
+    """Return a Bearer credential from an Authorization header, if valid."""
+    if not authorization:
+        return None
+    scheme, separator, credential = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+    return credential.strip() or None
 
-function showError(message) {
-  statusEl.hidden = false;
-  statusEl.className = "status error";
-  statusEl.textContent = `⚠ ${message}`;
-}
 
-function renderReport(data) {
-  lastReport = data;
-  statusEl.hidden = true;
-  reportEl.hidden = false;
-  reportEl.innerHTML =
-    toolbar() +
-    scorecard(data) +
-    severityTiles(data.summary.by_severity) +
-    categoryBars(data.summary.by_category) +
-    fileSection(data.files);
-  document.getElementById("export-md").addEventListener("click", exportMarkdown);
-  document.getElementById("export-json").addEventListener("click", exportJSON);
-  requestAnimationFrame(animateGauge);
-}
+class Handler(BaseHTTPRequestHandler):
+    server_version = "CleanCodeChecker/1.0"
 
-function toolbar() {
-  return `<div class="toolbar">
-    <button id="export-md" class="btn-ghost" type="button">⬇ Markdown</button>
-    <button id="export-json" class="btn-ghost" type="button">⬇ JSON</button>
-  </div>`;
-}
+    def do_GET(self) -> None:  # noqa: N802 (name fixed by BaseHTTPRequestHandler)
+        route = urlparse(self.path)
+        if route.path == "/api/analyze":
+            self._handle_analyze(parse_qs(route.query))
+        else:
+            self._serve_static(route.path)
 
-/* ---- sections --------------------------------------------------------- */
+    # -- routes ------------------------------------------------------------
 
-function scorecard(data) {
-  const { repo, stats, summary } = data;
-  const langs = Object.entries(stats.languages)
-    .slice(0, 4)
-    .map(([name, n]) => `${name} (${n})`)
-    .join(", ");
-  return `
-  <div class="panel scorecard">
-    ${gauge(summary.score, summary.grade)}
-    <div class="repo-head">
-      <h2><a href="${escapeAttr(repo.url)}" target="_blank" rel="noopener">${escapeHtml(repo.full_name)}</a></h2>
-      ${repo.description ? `<p class="desc">${escapeHtml(repo.description)}</p>` : ""}
-      <div class="meta">
-        <span>★ <b>${formatNumber(repo.stars)}</b></span>
-        <span><b>${formatNumber(stats.files_analyzed)}</b> files scanned</span>
-        <span><b>${formatNumber(stats.total_loc)}</b> lines of code</span>
-        <span><b>${formatNumber(stats.total_findings)}</b> findings</span>
-        <span>${escapeHtml(langs)}</span>
-      </div>
-    </div>
-  </div>`;
-}
+    def _handle_analyze(self, query: dict[str, list[str]]) -> None:
+        repo = (query.get("repo", [""])[0]).strip()
+        token = extract_bearer_token(self.headers.get("Authorization"))
+        if not repo:
+            self._send_json({"error": "Missing 'repo' parameter."}, status=400)
+            return
+        try:
+            report = analyze_repo(repo, token)
+            self._send_json(report)
+        except GitHubError as error:
+            self._send_json({"error": str(error)}, status=400)
+        except Exception as error:  # noqa: BLE001 — never leak a stack trace to the client
+            self._log_unexpected(error)
+            self._send_json({"error": "Unexpected server error while analysing the repo."}, status=500)
 
-function gauge(score, grade) {
-  const radius = 65;
-  const circumference = 2 * Math.PI * radius;
-  const color = gaugeColor(score);
-  return `
-  <div class="gauge">
-    <svg width="150" height="150" viewBox="0 0 150 150">
-      <circle class="track" cx="75" cy="75" r="${radius}" fill="none" stroke-width="12" />
-      <circle class="value" cx="75" cy="75" r="${radius}" fill="none" stroke-width="12"
-              stroke="${color}" stroke-dasharray="${circumference}"
-              stroke-dashoffset="${circumference}"
-              data-target="${circumference * (1 - score / 100)}" />
-    </svg>
-    <div class="gauge-center">
-      <div class="grade" style="color:${color}">${grade}</div>
-      <div class="num">${score} / 100</div>
-    </div>
-  </div>`;
-}
+    def _serve_static(self, path: str) -> None:
+        relative = "index.html" if path in ("/", "") else path.lstrip("/")
+        target = os.path.normpath(os.path.join(WEB_DIR, relative))
+        # Require a real path-separator boundary so a sibling like "webapp"
+        # can't satisfy a bare prefix match and escape WEB_DIR.
+        if not target.startswith(WEB_DIR + os.sep):
+            self._send_bytes(b"Not found", 404, "text/plain")
+            return
+        content_type = mimetypes.guess_type(target)[0] or "application/octet-stream"
+        try:
+            with open(target, "rb") as handle:
+                body = handle.read()
+        except OSError:
+            # Missing file, a directory, a permission error, or a delete-between-
+            # check-and-open race all resolve to a clean 404.
+            self._send_bytes(b"Not found", 404, "text/plain")
+            return
+        self._send_bytes(body, 200, content_type)
 
-function severityTiles(bySeverity) {
-  const labels = { major: "Major issues", minor: "Minor issues", info: "Suggestions" };
-  const tiles = SEVERITIES.map((sev) => `
-    <div class="tile ${sev}">
-      <div class="n">${formatNumber(bySeverity[sev] || 0)}</div>
-      <div class="l">${labels[sev]}</div>
-    </div>`).join("");
-  return `<div class="tiles">${tiles}</div>`;
-}
+    # -- response helpers --------------------------------------------------
 
-function categoryBars(byCategory) {
-  const entries = Object.entries(byCategory);
-  if (entries.length === 0) return "";
-  const max = Math.max(...entries.map(([, n]) => n));
-  const rows = entries.map(([cat, n]) => `
-    <div class="bar-row">
-      <span class="cat">${escapeHtml(cat)}</span>
-      <span class="bar-track"><span class="bar-fill" style="width:${(n / max) * 100}%"></span></span>
-      <span class="cnt">${n}</span>
-    </div>`).join("");
-  return `
-  <div>
-    <h3 class="section-title">Findings by category</h3>
-    <div class="panel bars">${rows}</div>
-  </div>`;
-}
+    def _send_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(body, status, "application/json; charset=utf-8")
 
-function fileSection(files) {
-  if (!files || files.length === 0) {
-    return `<div class="panel clean-banner">✨ No clean-code issues found. Nicely done!</div>`;
-  }
-  const cards = files.map((file, index) => fileCard(file, index === 0)).join("");
-  return `<div><h3 class="section-title">Top files to review</h3>
-            <div class="report" style="gap:12px">${cards}</div></div>`;
-}
+    def _send_bytes(self, body: bytes, status: int, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-function fileCard(file, open) {
-  const counts = countBySeverity(file.findings);
-  const pills = SEVERITIES.filter((s) => counts[s])
-    .map((s) => `<span class="pill ${s}">${counts[s]} ${s}</span>`)
-    .join("");
-  const rows = file.findings.map((f) => `
-    <div class="finding">
-      <span class="ln">L${f.line}</span>
-      <span class="sev ${f.severity}">${f.severity}</span>
-      <span class="msg">${escapeHtml(f.message)} <span class="rule">${escapeHtml(f.rule)}</span></span>
-    </div>`).join("");
-  return `
-  <details class="panel file" ${open ? "open" : ""}>
-    <summary>
-      <span class="caret">▶</span>
-      <span class="path">${escapeHtml(file.path)}</span>
-      <span class="count">${pills}</span>
-    </summary>
-    <div class="findings">${rows}</div>
-  </details>`;
-}
+    def _log_unexpected(self, error: Exception) -> None:
+        sys.stderr.write(f"[error] {type(error).__name__}: {error}\n")
 
-/* ---- export ----------------------------------------------------------- */
+    def log_message(self, fmt: str, *args) -> None:  # quieter, single-line logs
+        sys.stderr.write(f"{self.address_string()} - {fmt % args}\n")
 
-function exportJSON() {
-  if (!lastReport) return;
-  downloadFile(`${slug(lastReport)}-clean-code.json`,
-    JSON.stringify(lastReport, null, 2), "application/json");
-}
 
-function exportMarkdown() {
-  if (!lastReport) return;
-  downloadFile(`${slug(lastReport)}-clean-code.md`, buildMarkdown(lastReport), "text/markdown");
-}
+def main() -> None:
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    url = f"http://{HOST}:{PORT}"
+    print(f"Clean Code Checker running at {url}")
+    print("Press Ctrl+C to stop.")
+    if "--no-browser" not in sys.argv:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — opening a browser is best-effort
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
 
-function slug(data) {
-  return data.repo.full_name.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-}
 
-function buildMarkdown(data) {
-  const { repo, stats, summary } = data;
-  const sev = summary.by_severity;
-  const lines = [
-    `# Clean Code Report — ${repo.full_name}`,
-    "",
-    `**Grade: ${summary.grade} (${summary.score} / 100)**`,
-    "",
-  ];
-  if (repo.description) lines.push(`> ${repo.description}`, "");
-  lines.push(
-    `- Repository: ${repo.url}`,
-    `- Stars: ${formatNumber(repo.stars)}`,
-    `- Files analyzed: ${formatNumber(stats.files_analyzed)}`,
-    `- Lines of code: ${formatNumber(stats.total_loc)}`,
-    `- Findings: ${formatNumber(stats.total_findings)} (${sev.major} major, ${sev.minor} minor, ${sev.info} info)`,
-    "",
-    "## Findings by category",
-    "",
-    "| Category | Count |",
-    "| --- | --- |",
-    ...Object.entries(summary.by_category).map(([c, n]) => `| ${c} | ${n} |`),
-    "",
-    "## Top files to review",
-    "",
-  );
-  if (!data.files.length) {
-    lines.push("No clean-code issues found. ✨");
-  } else {
-    for (const file of data.files) {
-      lines.push(`### \`${file.path}\``, "");
-      for (const f of file.findings) {
-        lines.push(`- **L${f.line}** _${f.severity}_ — ${f.message} \`${f.rule}\``);
-      }
-      lines.push("");
-    }
-  }
-  lines.push("", `_Generated by Clean Code Checker on ${repo.full_name}._`);
-  return lines.join("\n");
-}
-
-function downloadFile(name, content, type) {
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
-}
-
-/* ---- helpers ---------------------------------------------------------- */
-
-function animateGauge() {
-  const ring = reportEl.querySelector(".gauge .value");
-  if (ring) ring.style.strokeDashoffset = ring.dataset.target;
-}
-
-function gaugeColor(score) {
-  if (score >= 80) return "#3ddc97";
-  if (score >= 60) return "#ffb454";
-  return "#ff5c7a";
-}
-
-function countBySeverity(findings) {
-  return findings.reduce((acc, f) => {
-    acc[f.severity] = (acc[f.severity] || 0) + 1;
-    return acc;
-  }, {});
-}
-
-function formatNumber(value) {
-  return Number(value || 0).toLocaleString("en-US");
-}
-
-function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = String(text ?? "");
-  return div.innerHTML;
-}
-
-function escapeAttr(text) {
-  return escapeHtml(text).replace(/"/g, "&quot;");
-}
+if __name__ == "__main__":
+    main()
