@@ -1,5 +1,7 @@
 # 🧼 Clean Code Checker
 
+**[View the project site](https://sadeqisaidmohaddes-star.github.io/clean-code-checker/)**
+
 A small web app that analyses any **GitHub repository** for clean-code issues and
 gives it a score and a letter grade. Point it at a repo, get a report listing the
 exact files and lines worth fixing.
