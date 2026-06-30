@@ -50,8 +50,9 @@ supported source file.
 Unauthenticated GitHub API access is limited to 60 requests/hour. The tool keeps
 its API usage tiny (file contents come from the raw CDN), but for **private repos**
 or **heavy use**, expand *“Add a token”* in the UI and paste a
-[personal access token](https://github.com/settings/tokens). The token is sent
-only to GitHub and never stored.
+[personal access token](https://github.com/settings/tokens). The browser sends
+the token to the local server in an `Authorization` header, never in the URL.
+It is kept only in memory, forwarded to GitHub, and never stored.
 
 ## Project layout
 
