@@ -31,8 +31,8 @@ async function runAnalysis(repo, token) {
 
   try {
     const params = new URLSearchParams({ repo });
-    if (token) params.set("token", token);
-    const response = await fetch(`/api/analyze?${params.toString()}`);
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const response = await fetch(`/api/analyze?${params.toString()}`, { headers });
     const data = await response.json();
     if (!response.ok || data.error) {
       throw new Error(data.error || `Request failed (${response.status}).`);
