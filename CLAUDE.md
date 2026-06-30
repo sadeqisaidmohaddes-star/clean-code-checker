@@ -89,7 +89,8 @@ CLAUDE.md              # this file
 ### Data flow
 
 ```
-app.py  ──GET /api/analyze?repo=&token=──▶  analyze_repo(reference, token)   [analyzer.py]
+app.js  ──GET /api/analyze?repo= + Bearer header──▶  app.py
+app.py  ──analyze_repo(reference, token)──────────▶  [analyzer.py]
   parse_repo ▶ get_repo_info ▶ get_tree            [github.py]
   select_code_files (skip vendored/tests, cap)     [languages.py]
   ThreadPoolExecutor: fetch_content + analyze_file [github.py + rules.py]

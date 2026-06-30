@@ -4,7 +4,10 @@ Run ``python app.py`` and open http://localhost:8000. The server has no
 third-party dependencies: it uses Python's standard library only.
 
   * ``GET /``            -> the single-page UI
-  * ``GET /api/analyze`` -> JSON report for ?repo=<url>&token=<optional>
+  * ``GET /api/analyze`` -> JSON report for ?repo=<url>
+
+An optional GitHub token is accepted through the ``Authorization: Bearer``
+header so credentials never appear in request URLs or access logs.
 """
 
 from __future__ import annotations
@@ -24,6 +27,16 @@ PORT = int(os.environ.get("PORT", "8000"))
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
+def extract_bearer_token(authorization: str | None) -> str | None:
+    """Return a Bearer credential from an Authorization header, if valid."""
+    if not authorization:
+        return None
+    scheme, separator, credential = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+    return credential.strip() or None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CleanCodeChecker/1.0"
 
@@ -38,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_analyze(self, query: dict[str, list[str]]) -> None:
         repo = (query.get("repo", [""])[0]).strip()
-        token = (query.get("token", [""])[0]).strip() or None
+        token = extract_bearer_token(self.headers.get("Authorization"))
         if not repo:
             self._send_json({"error": "Missing 'repo' parameter."}, status=400)
             return
